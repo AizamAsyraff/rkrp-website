@@ -60,7 +60,7 @@ app.get('/auth/discord/callback', async (req, res) => {
     req.session.user = await profileResponse.json();
     req.session.accessToken = token.access_token;
     delete req.session.oauthState;
-    res.redirect('/claim.html');
+    res.redirect('/dashboard.html');
   } catch (error) {
     console.error(error.message);
     res.redirect('/?error=auth');
@@ -68,6 +68,29 @@ app.get('/auth/discord/callback', async (req, res) => {
 });
 
 app.get('/api/me', (req, res) => res.json({ user: req.session.user || null, configured: configured() }));
+
+app.get('/api/server-status', async (_, res) => {
+  try {
+    const response = await fetch('https://servers-frontend.fivem.net/api/servers/single/ler7ry4');
+    if (!response.ok) throw new Error('FiveM unavailable');
+    const payload = await response.json();
+    const server = payload.Data || payload;
+    const players = Array.isArray(server.players) ? server.players.slice(0, 100) : [];
+    res.json({ online: true, onlinePlayers: Number(server.clients ?? players.length), maxPlayers: Number(server.sv_maxclients ?? 0), players: players.map((p) => ({ name: String(p.name || 'Unknown').slice(0, 48), ping: Number(p.ping || 0) })) });
+  } catch { res.json({ online: false, onlinePlayers: 0, maxPlayers: 0, players: [] }); }
+});
+
+app.get('/api/claim-status', async (req, res) => {
+  if (!req.session.user) return res.status(401).json({ error: 'Sila login Discord dahulu.' });
+  if (!configured()) return res.json({ configured: false, claimed: false });
+  try {
+    const response = await fetch(`${discordApi}/guilds/${process.env.DISCORD_GUILD_ID}/members/${req.session.user.id}`, { headers: authHeaders() });
+    if (response.status === 404) return res.json({ configured: true, claimed: false, inGuild: false });
+    if (!response.ok) throw new Error('Member check failed');
+    const member = await response.json();
+    res.json({ configured: true, inGuild: true, claimed: (member.roles || []).includes(process.env.DISCORD_WHITELIST_ROLE_ID) });
+  } catch { res.status(502).json({ error: 'Tidak dapat menyemak role Discord.' }); }
+});
 
 app.post('/api/claim', async (req, res) => {
   if (!configured()) return res.status(503).json({ error: 'Portal belum dikonfigurasi oleh admin.' });
