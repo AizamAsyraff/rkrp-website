@@ -75,12 +75,19 @@ app.get('/api/me', (req, res) => res.json({ user: req.session.user || null, conf
 
 app.get('/api/server-status', async (_, res) => {
   try {
-    const response = await fetch('https://servers-frontend.fivem.net/api/servers/single/ler7ry4');
-    if (!response.ok) throw new Error('FiveM unavailable');
-    const payload = await response.json();
-    const server = payload.Data || payload;
-    const players = Array.isArray(server.players) ? server.players.slice(0, 100) : [];
-    res.json({ online: true, onlinePlayers: Number(server.clients ?? players.length), maxPlayers: Number(server.sv_maxclients ?? 0), players: players.map((p) => ({ name: String(p.name || 'Unknown').slice(0, 48), ping: Number(p.ping || 0) })) });
+    const join = await fetch('https://cfx.re/join/ler7ry4');
+    const endpoint = join.headers.get('x-citizenfx-url');
+    if (!endpoint) throw new Error('FiveM endpoint unavailable');
+    const baseUrl = new URL(endpoint.endsWith('/') ? endpoint : `${endpoint}/`);
+    const [playersResponse, infoResponse] = await Promise.all([
+      fetch(new URL('players.json', baseUrl)),
+      fetch(new URL('info.json', baseUrl))
+    ]);
+    if (!playersResponse.ok || !infoResponse.ok) throw new Error('FiveM status unavailable');
+    const players = await playersResponse.json();
+    const info = await infoResponse.json();
+    const playerList = Array.isArray(players) ? players.slice(0, 100) : [];
+    res.json({ online: true, onlinePlayers: playerList.length, maxPlayers: Number(info.vars?.sv_maxClients ?? 0), players: playerList.map((p) => ({ name: String(p.name || 'Unknown').slice(0, 48), ping: Number(p.ping || 0) })) });
   } catch { res.json({ online: false, onlinePlayers: 0, maxPlayers: 0, players: [] }); }
 });
 
