@@ -1,0 +1,15 @@
+{
+  "name": "rkrp-portal",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Revolution Kita Roleplay citizen whitelist portal",
+  "scripts": {
+    "dev": "node server.js",
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "express-session": "^1.18.1"
+  }
+}
