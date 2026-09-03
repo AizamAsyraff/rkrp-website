@@ -18,17 +18,24 @@ app.use(session({
   secret: process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex'),
   resave: false,
   saveUninitialized: false,
-  cookie: { httpOnly: true, sameSite: 'lax', secure: process.env.NODE_ENV === 'production', maxAge: 1000 * 60 * 60 * 24 }
+  cookie: { httpOnly: true, sameSite: 'lax', secure: process.env.NODE_ENV === 'production', maxAge: 1000 * 60 * 60 * 24 * 30 }
 }));
-app.use(express.static('public'));
+app.use(express.static('public', { index: false }));
+
+app.get('/', (req, res) => {
+  if (req.session.user) return res.redirect('/dashboard.html');
+  res.sendFile(require('path').join(__dirname, 'public', 'index.html'));
+});
 
 const configured = () => required.every((key) => process.env[key] && !process.env[key].startsWith('PASTE_'));
 const authHeaders = () => ({ Authorization: `Bot ${process.env.DISCORD_BOT_TOKEN}` });
 
 app.get('/auth/discord', (req, res) => {
   if (!configured()) return res.redirect('/?error=config');
+  if (req.session.oauthStartedAt && Date.now() - req.session.oauthStartedAt < 30_000) return res.redirect('/?error=wait');
   const state = crypto.randomBytes(24).toString('hex');
   req.session.oauthState = state;
+  req.session.oauthStartedAt = Date.now();
   const query = new URLSearchParams({
     client_id: process.env.DISCORD_CLIENT_ID,
     redirect_uri: process.env.DISCORD_REDIRECT_URI,
@@ -64,6 +71,7 @@ app.get('/auth/discord/callback', async (req, res) => {
     req.session.user = await profileResponse.json();
     req.session.accessToken = token.access_token;
     delete req.session.oauthState;
+    delete req.session.oauthStartedAt;
     res.redirect('/dashboard.html');
   } catch (error) {
     console.error(error.message);
