@@ -53,8 +53,12 @@ app.get('/auth/discord/callback', async (req, res) => {
         redirect_uri: process.env.DISCORD_REDIRECT_URI
       })
     });
-    if (!tokenResponse.ok) throw new Error('OAuth token exchange failed');
-    const token = await tokenResponse.json();
+    const tokenBody = await tokenResponse.text();
+    if (!tokenResponse.ok) {
+      console.error(`Discord OAuth exchange failed (${tokenResponse.status}): ${tokenBody}`);
+      throw new Error('OAuth token exchange failed');
+    }
+    const token = JSON.parse(tokenBody);
     const profileResponse = await fetch(`${discordApi}/users/@me`, { headers: { Authorization: `Bearer ${token.access_token}` } });
     if (!profileResponse.ok) throw new Error('Unable to read Discord profile');
     req.session.user = await profileResponse.json();
