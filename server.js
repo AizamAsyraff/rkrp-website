@@ -29,7 +29,7 @@ app.use(session({
   }
 }));
 
-// Guard: /dashboard.html requires session — redirect to / if not logged in
+// Guard: /dashboard.html requires session
 app.get('/dashboard.html', (req, res) => {
   if (!req.session.user) return res.redirect('/');
   res.sendFile(path.join(__dirname, 'public', 'dashboard.html'));
@@ -44,8 +44,21 @@ app.get('/', (req, res) => {
 
 const configured = () => required.every((key) => process.env[key] && !process.env[key].startsWith('PASTE_'));
 const authHeaders = () => ({ Authorization: `Bot ${process.env.DISCORD_BOT_TOKEN}` });
-
 const CLAIM_CACHE_TTL = 5 * 60 * 1000;
+
+// Fetch with retry on 429 — respects Retry-After header from Discord
+async function fetchWithRetry(url, options = {}, maxRetries = 3) {
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    const res = await fetch(url, options);
+    if (res.status !== 429) return res;
+    const retryAfter = res.headers.get('retry-after');
+    const waitMs = retryAfter ? parseFloat(retryAfter) * 1000 : 1000 * Math.pow(2, attempt);
+    console.log(`Discord rate limited, retrying in ${waitMs}ms (attempt ${attempt + 1}/${maxRetries})`);
+    await new Promise(r => setTimeout(r, waitMs));
+  }
+  // Return last response even if still 429
+  return fetch(url, options);
+}
 
 app.get('/auth/discord', (req, res) => {
   if (!configured()) return res.redirect('/?error=config');
@@ -66,7 +79,7 @@ app.get('/auth/discord', (req, res) => {
 app.get('/auth/discord/callback', async (req, res) => {
   if (!req.query.code || req.query.state !== req.session.oauthState) return res.redirect('/?error=auth');
   try {
-    const tokenResponse = await fetch(`${discordApi}/oauth2/token`, {
+    const tokenResponse = await fetchWithRetry(`${discordApi}/oauth2/token`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: new URLSearchParams({
@@ -80,10 +93,14 @@ app.get('/auth/discord/callback', async (req, res) => {
     const tokenBody = await tokenResponse.text();
     if (!tokenResponse.ok) {
       console.error(`Discord OAuth exchange failed (${tokenResponse.status}): ${tokenBody}`);
+      // If still rate limited after retries, tell user to wait instead of generic auth error
+      if (tokenResponse.status === 429) return res.redirect('/?error=ratelimit');
       throw new Error('OAuth token exchange failed');
     }
     const token = JSON.parse(tokenBody);
-    const profileResponse = await fetch(`${discordApi}/users/@me`, { headers: { Authorization: `Bearer ${token.access_token}` } });
+    const profileResponse = await fetchWithRetry(`${discordApi}/users/@me`, {
+      headers: { Authorization: `Bearer ${token.access_token}` }
+    });
     if (!profileResponse.ok) throw new Error('Unable to read Discord profile');
     req.session.user = await profileResponse.json();
     req.session.accessToken = token.access_token;
@@ -127,7 +144,10 @@ app.get('/api/claim-status', async (req, res) => {
   }
 
   try {
-    const response = await fetch(`${discordApi}/guilds/${process.env.DISCORD_GUILD_ID}/members/${req.session.user.id}`, { headers: authHeaders() });
+    const response = await fetchWithRetry(
+      `${discordApi}/guilds/${process.env.DISCORD_GUILD_ID}/members/${req.session.user.id}`,
+      { headers: authHeaders() }
+    );
     if (response.status === 404) {
       const data = { configured: true, claimed: false, inGuild: false };
       req.session.claimCache = { data, fetchedAt: Date.now() };
@@ -146,12 +166,14 @@ app.post('/api/claim', async (req, res) => {
   if (!req.session.user || !req.session.accessToken) return res.status(401).json({ error: 'Sila login Discord dahulu.' });
   try {
     const memberUrl = `${discordApi}/guilds/${process.env.DISCORD_GUILD_ID}/members/${req.session.user.id}`;
-    const join = await fetch(memberUrl, {
+    const join = await fetchWithRetry(memberUrl, {
       method: 'PUT', headers: { ...authHeaders(), 'Content-Type': 'application/json' },
       body: JSON.stringify({ access_token: req.session.accessToken })
     });
     if (!join.ok && join.status !== 204) throw new Error('Discord membership check failed');
-    const role = await fetch(`${memberUrl}/roles/${process.env.DISCORD_WHITELIST_ROLE_ID}`, { method: 'PUT', headers: authHeaders() });
+    const role = await fetchWithRetry(`${memberUrl}/roles/${process.env.DISCORD_WHITELIST_ROLE_ID}`, {
+      method: 'PUT', headers: authHeaders()
+    });
     if (!role.ok && role.status !== 204) throw new Error('Role assignment failed');
     delete req.session.claimCache;
     res.json({ ok: true, message: 'Berjaya! Role Warga RKRP telah ditambah ke Discord anda.' });
