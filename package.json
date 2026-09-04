@@ -8,8 +8,9 @@
     "start": "node server.js"
   },
   "dependencies": {
-    "cookie-session": "^2.1.0",
+    "connect-sqlite3": "^0.9.15",
     "dotenv": "^16.4.7",
-    "express": "^4.21.2"
+    "express": "^4.21.2",
+    "express-session": "^1.18.1"
   }
 }

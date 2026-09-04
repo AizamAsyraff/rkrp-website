@@ -2,7 +2,8 @@ require('dotenv').config();
 
 const crypto = require('crypto');
 const express = require('express');
-const cookieSession = require('cookie-session');
+const session = require('express-session');
+const SQLiteStore = require('connect-sqlite3')(session);
 
 const app = express();
 const port = Number(process.env.PORT || 3000);
@@ -12,26 +13,20 @@ const required = [
   'DISCORD_BOT_TOKEN', 'DISCORD_GUILD_ID', 'DISCORD_WHITELIST_ROLE_ID'
 ];
 
-const SESSION_DAYS = 60;
-const SESSION_MAX_AGE = 1000 * 60 * 60 * 24 * SESSION_DAYS;
-
 app.set('trust proxy', 1);
 app.use(express.json());
-
-// cookie-session: data disimpan dalam cookie itu sendiri (encrypted + signed)
-// Survive Render restart, deploy, scale — tak perlu external store
-app.use(cookieSession({
-  name: 'rkrp_session',
-  keys: [
-    process.env.SESSION_SECRET || 'PLEASE_SET_SESSION_SECRET_IN_ENV',
-    process.env.SESSION_SECRET_OLD || 'PLEASE_SET_SESSION_SECRET_IN_ENV'
-  ],
-  maxAge: SESSION_MAX_AGE,
-  httpOnly: true,
-  sameSite: 'lax',
-  secure: process.env.NODE_ENV === 'production'
+app.use(session({
+  store: new SQLiteStore({ db: 'sessions.db', dir: './' }),
+  secret: process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex'),
+  resave: false,
+  saveUninitialized: false,
+  cookie: {
+    httpOnly: true,
+    sameSite: 'lax',
+    secure: process.env.NODE_ENV === 'production',
+    maxAge: 1000 * 60 * 60 * 24 * 30  // 30 days
+  }
 }));
-
 app.use(express.static('public', { index: false }));
 
 app.get('/', (req, res) => {
@@ -42,25 +37,11 @@ app.get('/', (req, res) => {
 const configured = () => required.every((key) => process.env[key] && !process.env[key].startsWith('PASTE_'));
 const authHeaders = () => ({ Authorization: `Bot ${process.env.DISCORD_BOT_TOKEN}` });
 
-// Retry helper untuk handle Discord 429
-async function fetchWithRetry(url, options, retries = 3) {
-  for (let i = 0; i < retries; i++) {
-    const res = await fetch(url, options);
-    if (res.status === 429) {
-      const retryAfter = (Number(res.headers.get('retry-after') || 2) + 1) * 1000;
-      console.warn(`Discord rate limited, retrying in ${retryAfter}ms (attempt ${i + 1}/${retries})`);
-      await new Promise(r => setTimeout(r, retryAfter));
-      continue;
-    }
-    return res;
-  }
-  throw new Error('Discord rate limit max retries exceeded');
-}
+// Cache TTL: 5 minutes for claim status to avoid hammering Discord API
+const CLAIM_CACHE_TTL = 5 * 60 * 1000;
 
 app.get('/auth/discord', (req, res) => {
   if (!configured()) return res.redirect('/?error=config');
-  // Kalau dah login, terus ke dashboard
-  if (req.session.user) return res.redirect('/dashboard.html');
   if (req.session.oauthStartedAt && Date.now() - req.session.oauthStartedAt < 30_000) return res.redirect('/?error=wait');
   const state = crypto.randomBytes(24).toString('hex');
   req.session.oauthState = state;
@@ -78,7 +59,7 @@ app.get('/auth/discord', (req, res) => {
 app.get('/auth/discord/callback', async (req, res) => {
   if (!req.query.code || req.query.state !== req.session.oauthState) return res.redirect('/?error=auth');
   try {
-    const tokenResponse = await fetchWithRetry(`${discordApi}/oauth2/token`, {
+    const tokenResponse = await fetch(`${discordApi}/oauth2/token`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: new URLSearchParams({
@@ -99,8 +80,10 @@ app.get('/auth/discord/callback', async (req, res) => {
     if (!profileResponse.ok) throw new Error('Unable to read Discord profile');
     req.session.user = await profileResponse.json();
     req.session.accessToken = token.access_token;
-    req.session.oauthState = null;
-    req.session.oauthStartedAt = null;
+    // Clear any cached claim status so it refreshes after login
+    delete req.session.claimCache;
+    delete req.session.oauthState;
+    delete req.session.oauthStartedAt;
     res.redirect('/dashboard.html');
   } catch (error) {
     console.error(error.message);
@@ -131,12 +114,25 @@ app.get('/api/server-status', async (_, res) => {
 app.get('/api/claim-status', async (req, res) => {
   if (!req.session.user) return res.status(401).json({ error: 'Sila login Discord dahulu.' });
   if (!configured()) return res.json({ configured: false, claimed: false });
+
+  // Return cached result if fresh (< 5 min) to avoid Discord rate limits
+  const cache = req.session.claimCache;
+  if (cache && (Date.now() - cache.fetchedAt) < CLAIM_CACHE_TTL) {
+    return res.json({ ...cache.data, cached: true });
+  }
+
   try {
     const response = await fetch(`${discordApi}/guilds/${process.env.DISCORD_GUILD_ID}/members/${req.session.user.id}`, { headers: authHeaders() });
-    if (response.status === 404) return res.json({ configured: true, claimed: false, inGuild: false });
+    if (response.status === 404) {
+      const data = { configured: true, claimed: false, inGuild: false };
+      req.session.claimCache = { data, fetchedAt: Date.now() };
+      return res.json(data);
+    }
     if (!response.ok) throw new Error('Member check failed');
     const member = await response.json();
-    res.json({ configured: true, inGuild: true, claimed: (member.roles || []).includes(process.env.DISCORD_WHITELIST_ROLE_ID) });
+    const data = { configured: true, inGuild: true, claimed: (member.roles || []).includes(process.env.DISCORD_WHITELIST_ROLE_ID) };
+    req.session.claimCache = { data, fetchedAt: Date.now() };
+    res.json(data);
   } catch { res.status(502).json({ error: 'Tidak dapat menyemak role Discord.' }); }
 });
 
@@ -152,6 +148,8 @@ app.post('/api/claim', async (req, res) => {
     if (!join.ok && join.status !== 204) throw new Error('Discord membership check failed');
     const role = await fetch(`${memberUrl}/roles/${process.env.DISCORD_WHITELIST_ROLE_ID}`, { method: 'PUT', headers: authHeaders() });
     if (!role.ok && role.status !== 204) throw new Error('Role assignment failed');
+    // Bust the cache after successful claim so next load shows updated status
+    delete req.session.claimCache;
     res.json({ ok: true, message: 'Berjaya! Role Warga RKRP telah ditambah ke Discord anda.' });
   } catch (error) {
     console.error(error.message);
@@ -159,10 +157,6 @@ app.post('/api/claim', async (req, res) => {
   }
 });
 
-app.post('/auth/logout', (req, res) => {
-  req.session = null; // cookie-session: null = clear cookie
-  res.json({ ok: true });
-});
-
+app.post('/auth/logout', (req, res) => req.session.destroy(() => res.json({ ok: true })));
 app.get('*', (_, res) => res.sendFile(require('path').join(__dirname, 'public', 'index.html')));
 app.listen(port, () => console.log(`RKRP Portal running on http://localhost:${port}`));
