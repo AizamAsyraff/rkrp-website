@@ -1,6 +1,7 @@
 require('dotenv').config();
 
 const crypto = require('crypto');
+const path = require('path');
 const express = require('express');
 const session = require('express-session');
 const SQLiteStore = require('connect-sqlite3')(session);
@@ -24,20 +25,26 @@ app.use(session({
     httpOnly: true,
     sameSite: 'lax',
     secure: process.env.NODE_ENV === 'production',
-    maxAge: 1000 * 60 * 60 * 24 * 30  // 30 days
+    maxAge: 1000 * 60 * 60 * 24 * 30
   }
 }));
+
+// Guard: /dashboard.html requires session — redirect to / if not logged in
+app.get('/dashboard.html', (req, res) => {
+  if (!req.session.user) return res.redirect('/');
+  res.sendFile(path.join(__dirname, 'public', 'dashboard.html'));
+});
+
 app.use(express.static('public', { index: false }));
 
 app.get('/', (req, res) => {
   if (req.session.user) return res.redirect('/dashboard.html');
-  res.sendFile(require('path').join(__dirname, 'public', 'index.html'));
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
 const configured = () => required.every((key) => process.env[key] && !process.env[key].startsWith('PASTE_'));
 const authHeaders = () => ({ Authorization: `Bot ${process.env.DISCORD_BOT_TOKEN}` });
 
-// Cache TTL: 5 minutes for claim status to avoid hammering Discord API
 const CLAIM_CACHE_TTL = 5 * 60 * 1000;
 
 app.get('/auth/discord', (req, res) => {
@@ -80,7 +87,6 @@ app.get('/auth/discord/callback', async (req, res) => {
     if (!profileResponse.ok) throw new Error('Unable to read Discord profile');
     req.session.user = await profileResponse.json();
     req.session.accessToken = token.access_token;
-    // Clear any cached claim status so it refreshes after login
     delete req.session.claimCache;
     delete req.session.oauthState;
     delete req.session.oauthStartedAt;
@@ -115,7 +121,6 @@ app.get('/api/claim-status', async (req, res) => {
   if (!req.session.user) return res.status(401).json({ error: 'Sila login Discord dahulu.' });
   if (!configured()) return res.json({ configured: false, claimed: false });
 
-  // Return cached result if fresh (< 5 min) to avoid Discord rate limits
   const cache = req.session.claimCache;
   if (cache && (Date.now() - cache.fetchedAt) < CLAIM_CACHE_TTL) {
     return res.json({ ...cache.data, cached: true });
@@ -148,7 +153,6 @@ app.post('/api/claim', async (req, res) => {
     if (!join.ok && join.status !== 204) throw new Error('Discord membership check failed');
     const role = await fetch(`${memberUrl}/roles/${process.env.DISCORD_WHITELIST_ROLE_ID}`, { method: 'PUT', headers: authHeaders() });
     if (!role.ok && role.status !== 204) throw new Error('Role assignment failed');
-    // Bust the cache after successful claim so next load shows updated status
     delete req.session.claimCache;
     res.json({ ok: true, message: 'Berjaya! Role Warga RKRP telah ditambah ke Discord anda.' });
   } catch (error) {
@@ -158,5 +162,5 @@ app.post('/api/claim', async (req, res) => {
 });
 
 app.post('/auth/logout', (req, res) => req.session.destroy(() => res.json({ ok: true })));
-app.get('*', (_, res) => res.sendFile(require('path').join(__dirname, 'public', 'index.html')));
+app.get('*', (_, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
 app.listen(port, () => console.log(`RKRP Portal running on http://localhost:${port}`));
